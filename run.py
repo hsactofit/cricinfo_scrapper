@@ -60,6 +60,139 @@ def _in_venv() -> bool:
     )
 
 
+_CHROMEDRIVER_CACHE     = _SCRIPT_DIR / ".chromedriver_path"
+_CHROME_VERSION_CACHE   = _SCRIPT_DIR / ".chrome_version"
+
+_CHROME_PATHS = [
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+]
+
+
+def _detect_chrome() -> tuple[int, str]:
+    """Return (major_version, full_version) for the installed Chrome, or (0, '')."""
+    import subprocess
+    for chrome in _CHROME_PATHS:
+        if Path(chrome).exists():
+            r = subprocess.run([chrome, "--version"], capture_output=True, text=True)
+            parts = r.stdout.strip().split()
+            if parts:
+                full = parts[-1]          # e.g. "146.0.7680.165"
+                major = int(full.split(".")[0])
+                return major, full
+    return 0, ""
+
+
+def _download_chromedriver(full_version: str, dest: Path) -> bool:
+    """Download the exact chromedriver build matching full_version from Google CDN."""
+    import io
+    import platform
+    import urllib.request
+    import zipfile
+
+    arch  = platform.machine()
+    plat  = "mac-arm64" if arch == "arm64" else "mac-x64"
+    url   = (
+        f"https://storage.googleapis.com/chrome-for-testing-public"
+        f"/{full_version}/{plat}/chromedriver-{plat}.zip"
+    )
+    print(f"[setup] Downloading chromedriver {full_version} ({plat})...")
+    try:
+        with urllib.request.urlopen(url, timeout=60) as resp:
+            data = resp.read()
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            for name in zf.namelist():
+                if name.endswith("/chromedriver") or name == "chromedriver":
+                    dest.write_bytes(zf.read(name))
+                    dest.chmod(0o755)
+                    print(f"[setup] Downloaded → {dest}")
+                    return True
+        print("[setup] chromedriver binary not found inside zip")
+    except Exception as exc:
+        print(f"[setup] Download failed: {exc}")
+    return False
+
+
+def _prepatch_cdc(path: Path) -> int:
+    """Replace cdc_ bytes so UC's patcher is a no-op → ad-hoc sig stays valid."""
+    import re, random, string
+
+    data  = path.read_bytes()
+    count = data.count(b"cdc_")
+    if count == 0:
+        return 0
+
+    def _rnd(_m):
+        return ("".join(random.choices(string.ascii_lowercase, k=3)) + "_").encode()
+
+    path.write_bytes(re.sub(b"cdc_", _rnd, data))
+    return count
+
+
+def _setup_chromedriver() -> str:
+    """Download the exact chromedriver that matches the installed Chrome, patch + sign it.
+
+    Why all this:
+      1. Version must match exactly — Chrome 146 needs chromedriver 146.
+      2. macOS SIGKILL (-9): UC patches the binary which invalidates its code signature.
+         Fix: pre-patch cdc_ ourselves → UC finds nothing → no-op → sig stays valid.
+    """
+    import subprocess
+
+    _LOCAL_DIR  = _SCRIPT_DIR / ".chromedriver"
+    _LOCAL_PATH = _LOCAL_DIR / "chromedriver"
+
+    # Cache hit — reuse if file still present
+    if _CHROMEDRIVER_CACHE.exists():
+        cached = _CHROMEDRIVER_CACHE.read_text().strip()
+        if Path(cached).exists():
+            return cached
+        print("[setup] Cached path gone, re-downloading...")
+
+    # Detect installed Chrome version
+    major, full_ver = _detect_chrome()
+    if full_ver:
+        print(f"[setup] Detected Chrome {full_ver}")
+    else:
+        raise RuntimeError(
+            "Google Chrome not found.\n"
+            "Install it: brew install --cask google-chrome"
+        )
+
+    # Save Chrome version for CHROME_VER constant (read after venv restart)
+    _CHROME_VERSION_CACHE.write_text(str(major))
+
+    _LOCAL_DIR.mkdir(exist_ok=True)
+
+    # Download exact-match chromedriver from Google CDN
+    if not _download_chromedriver(full_ver, _LOCAL_PATH):
+        raise RuntimeError(
+            f"Could not download chromedriver {full_ver}.\n"
+            "Check internet connection and try again."
+        )
+
+    # Remove quarantine
+    subprocess.run(["xattr", "-d", "com.apple.quarantine", str(_LOCAL_PATH)], capture_output=True)
+    subprocess.run(["xattr", "-c", str(_LOCAL_PATH)], capture_output=True)
+
+    # Strip existing sig then pre-patch cdc_ strings
+    subprocess.run(["codesign", "--remove-signature", str(_LOCAL_PATH)], capture_output=True)
+    count = _prepatch_cdc(_LOCAL_PATH)
+    print(f"[setup] Pre-patched {count} cdc_ occurrences")
+
+    # Ad-hoc sign so macOS won't kill it
+    r = subprocess.run(["codesign", "-s", "-", str(_LOCAL_PATH)], capture_output=True, text=True)
+    if r.returncode == 0:
+        print("[setup] Ad-hoc signed chromedriver")
+    else:
+        print(f"[setup] codesign warning (may still work): {r.stderr.strip()}")
+
+    local_path = str(_LOCAL_PATH)
+    _CHROMEDRIVER_CACHE.write_text(local_path)
+    print(f"[setup] chromedriver ready at: {local_path}")
+    return local_path
+
+
 def _bootstrap() -> None:
     import subprocess
     if not _VENV_DIR.exists():
@@ -71,6 +204,7 @@ def _bootstrap() -> None:
         [str(pip), "install", "--quiet", "--upgrade"] + _REQUIREMENTS,
         check=True,
     )
+    _setup_chromedriver()
     print("[setup] Done. Restarting inside venv...\n")
     os.execv(str(_VENV_PY), [str(_VENV_PY)] + sys.argv)
 
@@ -103,7 +237,11 @@ OUTPUT_DIR   = _SCRIPT_DIR / "output_json"
 CHUNKS_DIR   = _SCRIPT_DIR / "chunks"
 PLAYERS_CSV  = _SCRIPT_DIR / "players.csv"
 MACHINE_ID   = os.environ.get("MACHINE_ID", "unknown")
-CHROME_VER   = int(os.environ.get("CHROME_VERSION", 146))
+CHROME_VER   = int(
+    os.environ.get("CHROME_VERSION")
+    or (_CHROME_VERSION_CACHE.read_text().strip() if _CHROME_VERSION_CACHE.exists() else "0")
+    or "146"
+)
 PAGE_DELAY   = float(os.environ.get("PAGE_DELAY", 2.0))
 
 OUTPUT_DIR.mkdir(exist_ok=True)
@@ -196,13 +334,36 @@ def _db_config() -> dict:
 # ── Browser helpers ───────────────────────────────────────────────────────────
 
 def _make_driver() -> uc.Chrome:
+    import shutil as _shutil
+    import subprocess as _sp
+
+    master = Path(
+        _CHROMEDRIVER_CACHE.read_text().strip()
+        if _CHROMEDRIVER_CACHE.exists()
+        else "/opt/homebrew/bin/chromedriver"
+    )
+
+    # Each worker process gets its own copy so UC's concurrent patches don't race.
+    worker_copy = master.parent / f"chromedriver_{os.getpid()}"
+    if not worker_copy.exists():
+        _shutil.copy2(master, worker_copy)
+        worker_copy.chmod(0o755)
+        _sp.run(["xattr", "-c", str(worker_copy)], capture_output=True)
+        # Pre-patch cdc_ on the worker copy so UC patcher writes nothing new
+        _prepatch_cdc(worker_copy)
+        _sp.run(["codesign", "--remove-signature", str(worker_copy)], capture_output=True)
+        _sp.run(["codesign", "-s", "-", str(worker_copy)], capture_output=True)
+
+    # Disable UC's patcher — binary is already patched + signed; re-patching invalidates sig
+    uc.Patcher.patch_exe = lambda self: None
+
     opts = uc.ChromeOptions()
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-gpu")
     opts.add_argument("--window-size=1280,900")
-    return uc.Chrome(options=opts, version_main=CHROME_VER)
+    return uc.Chrome(options=opts, version_main=CHROME_VER, driver_executable_path=str(worker_copy))
 
 
 def _dismiss_popup(driver: uc.Chrome) -> None:
