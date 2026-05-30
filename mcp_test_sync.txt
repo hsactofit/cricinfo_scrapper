@@ -1,0 +1,5 @@
+=== SEO AUTOMATION HYBRID TEST ===
+This file was modified locally on disk by our custom tools.
+The model only specified the change instructions.
+The runner script read the updated bytes from disk and synced it via GitHub MCP.
+=================================
